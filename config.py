@@ -26,6 +26,10 @@ DISCORD_TOKEN: str = _require("DISCORD_TOKEN")
 BALLDONTLIE_API_KEY: str = _require("BALLDONTLIE_API_KEY")
 ODDS_API_KEY: str = _require("ODDS_API_KEY")
 
+# ── Optional sport API keys ────────────────────────────────────────────────────
+# Pandascore (esports): https://pandascore.co/ — free tier 1000 req/hr
+PANDASCORE_API_KEY: str = os.getenv("PANDASCORE_API_KEY", "")
+
 # ── Optional / tunable ────────────────────────────────────────────────────────
 # If set, slash commands sync instantly to a single test guild instead of
 # propagating globally (which can take up to an hour).
@@ -37,8 +41,15 @@ DISCORD_GUILD_ID: int | None = (
 
 # ── API base URLs ─────────────────────────────────────────────────────────────
 BALLDONTLIE_BASE = "https://api.balldontlie.io/v1"
-NHL_BASE = "https://api-web.nhle.com/v1"
-ODDS_BASE = "https://api.the-odds-api.com/v4"
+NHL_BASE         = "https://api-web.nhle.com/v1"
+ODDS_BASE        = "https://api.the-odds-api.com/v4"
+ESPN_NFL_BASE    = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
+ESPN_SOCCER_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+ESPN_TENNIS_BASE = "https://site.api.espn.com/apis/site/v2/sports/tennis"
+PANDASCORE_BASE  = "https://api.pandascore.co"
+
+# Supported sports
+SUPPORTED_SPORTS = ["NBA", "NFL", "NHL", "SOCCER", "TENNIS", "ESPORTS"]
 
 # ── Analysis thresholds ───────────────────────────────────────────────────────
 # Confidence buckets used across commands
