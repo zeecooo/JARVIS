@@ -30,8 +30,11 @@ ODDS_API_KEY: str = _require("ODDS_API_KEY")
 # Pandascore (esports): https://pandascore.co/ — free tier 1000 req/hr
 PANDASCORE_API_KEY: str = os.getenv("PANDASCORE_API_KEY", "")
 
-# OCR.Space — used for vision (reading slip photos). Free key: https://ocr.space/ocrapi
+# OCR.Space — fallback vision (reading slip photos). Free key: https://ocr.space/ocrapi
 OCR_SPACE_API_KEY: str = os.getenv("OCR_SPACE_API_KEY", "")
+
+# Anthropic — used for Claude Vision to read slip photos (preferred over OCR.Space)
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 
 # ── Optional / tunable ────────────────────────────────────────────────────────
 # If set, slash commands sync instantly to a single test guild instead of

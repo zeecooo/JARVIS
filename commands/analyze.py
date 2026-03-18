@@ -29,24 +29,70 @@ log = logging.getLogger(__name__)
 
 
 async def _extract_slip_from_image(image_url: str) -> str:
-    """Download an image and use OCR.Space to extract the slip text."""
-    if not config.OCR_SPACE_API_KEY:
-        raise ValueError("OCR_SPACE_API_KEY is not set — cannot read images.")
+    """Download a betting slip image and extract the prop text using Claude Vision.
 
+    Falls back to OCR.Space if ANTHROPIC_API_KEY is not set.
+    """
     async with aiohttp.ClientSession() as session:
         async with session.get(image_url) as resp:
             image_bytes = await resp.read()
+            content_type = resp.content_type or "image/png"
 
+    # ── Claude Vision (preferred) ──────────────────────────────────────────────
+    if config.ANTHROPIC_API_KEY:
+        import base64
+        import anthropic
+
+        b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        media_type = content_type if content_type.startswith("image/") else "image/png"
+
+        client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+        message = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "This is a sports betting slip. Extract every prop leg exactly as shown. "
+                                "Output ONLY the legs, one per line, in the format: "
+                                "PlayerName Over/Under Line PropType\n"
+                                "Example: LeBron James Over 25.5 PTS\n"
+                                "Do not add commentary, just the legs."
+                            ),
+                        },
+                    ],
+                }
+            ],
+        )
+        text = message.content[0].text.strip()
+        if not text:
+            raise ValueError("Claude Vision returned no text from the image.")
+        return text
+
+    # ── OCR.Space fallback ─────────────────────────────────────────────────────
+    if not config.OCR_SPACE_API_KEY:
+        raise ValueError(
+            "No vision API configured. Set ANTHROPIC_API_KEY (recommended) or OCR_SPACE_API_KEY."
+        )
+
+    async with aiohttp.ClientSession() as session:
         data = aiohttp.FormData()
         data.add_field("apikey", config.OCR_SPACE_API_KEY)
         data.add_field("language", "eng")
         data.add_field("isOverlayRequired", "false")
-        data.add_field(
-            "file",
-            image_bytes,
-            filename="slip.png",
-            content_type="image/png",
-        )
+        data.add_field("file", image_bytes, filename="slip.png", content_type="image/png")
 
         async with session.post("https://api.ocr.space/parse/image", data=data) as resp:
             result = await resp.json()
