@@ -25,15 +25,20 @@ log = logging.getLogger(__name__)
 
 _STATS_HEADERS = {
     "Accept": "application/json, text/plain, */*",
+    "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
-    "Host": "stats.nba.com",
+    # Do NOT set Host explicitly — aiohttp sets it correctly from the URL.
+    # Explicit Host header causes 403s from NBA.com on cloud IPs.
     "Origin": "https://www.nba.com",
     "Referer": "https://www.nba.com/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/123.0.0.0 Safari/537.36"
     ),
     "x-nba-stats-origin": "stats",
     "x-nba-stats-token": "true",
@@ -86,6 +91,64 @@ _NBA_TEAMS: dict[int, dict] = {
 
 # Reverse lookup: abbreviation → team_id
 _ABBR_TO_ID: dict[str, int] = {v["abbreviation"]: k for k, v in _NBA_TEAMS.items()}
+
+# ── Static player map ─────────────────────────────────────────────────────────
+# NBA.com player IDs are stable. This covers all template players so we never
+# need to hit commonallplayers just to score a pick.
+# Format: display_name → (player_id, team_id, position)
+
+_KNOWN_PLAYERS: dict[str, tuple[int, int, str]] = {
+    "LeBron James":           (2544,    1610612747, "F"),   # LAL
+    "Stephen Curry":          (201939,  1610612744, "G"),   # GSW
+    "Kevin Durant":           (201142,  1610612756, "F"),   # PHX
+    "Giannis Antetokounmpo":  (203507,  1610612749, "F"),   # MIL
+    "Nikola Jokic":           (203999,  1610612743, "C"),   # DEN
+    "Luka Doncic":            (1629029, 1610612747, "F"),   # LAL (traded 2025)
+    "Jayson Tatum":           (1628369, 1610612738, "F"),   # BOS
+    "Joel Embiid":            (203954,  1610612755, "C"),   # PHI
+    "Shai Gilgeous-Alexander":(1628983, 1610612760, "G"),   # OKC
+    "Tyrese Haliburton":      (1630169, 1610612754, "G"),   # IND
+    "Anthony Davis":          (203076,  1610612747, "C"),   # LAL
+    "Donovan Mitchell":       (1628378, 1610612739, "G"),   # CLE
+    "Bam Adebayo":            (1628389, 1610612748, "C"),   # MIA
+    "De'Aaron Fox":           (1628368, 1610612759, "G"),   # SAS
+    "Victor Wembanyama":      (1641705, 1610612759, "C"),   # SAS
+    "Cade Cunningham":        (1630595, 1610612765, "G"),   # DET
+    "Trae Young":             (1629027, 1610612737, "G"),   # ATL
+    "Devin Booker":           (1626164, 1610612756, "G"),   # PHX
+    "Ja Morant":              (1629630, 1610612763, "G"),   # MEM
+    "Zion Williamson":        (1629627, 1610612740, "F"),   # NOP
+    "Paolo Banchero":         (1631094, 1610612753, "F"),   # ORL
+    "Damian Lillard":         (203081,  1610612749, "G"),   # MIL
+    "James Harden":           (201935,  1610612746, "G"),   # LAC
+    "Kawhi Leonard":          (202695,  1610612746, "F"),   # LAC
+    "Paul George":            (202331,  1610612755, "F"),   # PHI
+    "Evan Mobley":            (1630596, 1610612739, "C"),   # CLE
+    "Scottie Barnes":         (1630567, 1610612761, "F"),   # TOR
+    "Jaren Jackson Jr.":      (1628991, 1610612763, "C"),   # MEM
+    "Darius Garland":         (1629636, 1610612739, "G"),   # CLE
+    "Fred VanVleet":          (1627832, 1610612745, "G"),   # HOU
+    "Anthony Edwards":        (1630162, 1610612750, "G"),   # MIN
+    "Karl-Anthony Towns":     (1626157, 1610612752, "C"),   # NYK
+    "Jalen Brunson":          (1628384, 1610612752, "G"),   # NYK
+    "Julius Randle":          (203944,  1610612750, "F"),   # MIN
+    "Pascal Siakam":          (1627783, 1610612754, "F"),   # IND
+    "Domantas Sabonis":       (1627734, 1610612758, "C"),   # SAC
+    "De'Andre Hunter":        (1629631, 1610612737, "F"),   # ATL
+    "Alperen Sengun":         (1630578, 1610612745, "C"),   # HOU
+    "Ivica Zubac":            (1627826, 1610612746, "C"),   # LAC
+    "Amen Thompson":          (1641706, 1610612745, "F"),   # HOU
+    "Jalen Green":            (1630224, 1610612745, "G"),   # HOU
+    "Brandon Ingram":         (1627742, 1610612759, "F"),   # SAS
+    "Mikal Bridges":          (1628969, 1610612752, "F"),   # NYK
+    "OG Anunoby":             (1628384, 1610612752, "F"),   # NYK
+    "Jaylen Brown":           (1627759, 1610612738, "F"),   # BOS
+    "Kristaps Porzingis":     (204001,  1610612738, "C"),   # BOS
+    "Al Horford":             (201143,  1610612738, "C"),   # BOS
+    "Josh Hart":              (1628404, 1610612752, "F"),   # NYK
+    "Nikola Vucevic":         (202696,  1610612741, "C"),   # CHI
+    "Zach LaVine":            (203897,  1610612741, "G"),   # CHI
+}
 
 # ── Nickname map (same as before) ─────────────────────────────────────────────
 _NICKNAME_MAP: dict[str, str] = {
@@ -241,7 +304,9 @@ class NBAClient:
         try:
             async with self._stats_session.get(url, params=params) as resp:
                 resp.raise_for_status()
-                return await resp.json(content_type=None)
+                data = await resp.json(content_type=None)
+                log.debug("NBA.com OK %s", url)
+                return data
         except aiohttp.ClientResponseError as exc:
             log.warning("NBA.com HTTP %s for %s: %s", exc.status, url, exc.message)
             return {}
@@ -297,9 +362,43 @@ class NBAClient:
         """
         Search for a player by name. Returns a dict matching the old
         BallDontLie shape: {id, first_name, last_name, team: {...}, position}
+
+        Checks the static _KNOWN_PLAYERS map first (no API call needed for
+        template players). Falls back to NBA.com commonallplayers API.
         """
         resolved = _normalize_name(name)
+
+        # ── Static map lookup (fast, no API call) ──────────────────────────
+        def _static_lookup(query: str) -> Optional[dict]:
+            q = query.strip().lower()
+            for display, (pid, tid, pos) in _KNOWN_PLAYERS.items():
+                if q == display.lower() or q in display.lower() or display.lower() in q:
+                    team_info = _NBA_TEAMS.get(tid, {})
+                    parts = display.split(" ", 1)
+                    return {
+                        "id":         pid,
+                        "first_name": parts[0],
+                        "last_name":  parts[1] if len(parts) > 1 else "",
+                        "position":   pos,
+                        "team": {
+                            "id":           tid,
+                            "abbreviation": team_info.get("abbreviation", ""),
+                            "full_name":    team_info.get("full_name", ""),
+                            "city":         team_info.get("city", ""),
+                            "name":         team_info.get("name", ""),
+                        },
+                    }
+            return None
+
+        result = _static_lookup(resolved) or _static_lookup(name)
+        if result:
+            return result
+
+        # ── NBA.com API fallback for unknown players ────────────────────────
         players = await self._get_all_players()
+        if not players:
+            log.warning("NBA.com commonallplayers returned empty — player '%s' not found", name)
+            return None
 
         def _score(p: dict) -> int:
             display = (p.get("display_first_last") or "").lower()
@@ -315,15 +414,7 @@ class NBAClient:
 
         scored = [(p, _score(p)) for p in players]
         scored.sort(key=lambda x: x[1], reverse=True)
-        best = scored[0] if scored else (None, 0)
-
-        if best[1] == 0:
-            # Try raw name as fallback
-            resolved2 = name.strip().lower()
-            for p in players:
-                if resolved2 in (p.get("display_first_last") or "").lower():
-                    best = (p, 1)
-                    break
+        best = scored[0] if scored and scored[0][1] > 0 else (None, 0)
 
         if not best[0]:
             return None
@@ -332,19 +423,15 @@ class NBAClient:
         player_id = p.get("person_id") or p.get("personid")
         team_id = int(p.get("team_id") or 0)
         team_info = _NBA_TEAMS.get(team_id, {})
-
-        # Get position from player info (cached)
         position = await self._get_player_position(player_id)
 
         display = p.get("display_first_last", "")
         parts = display.split(" ", 1)
-        first = parts[0] if parts else ""
-        last = parts[1] if len(parts) > 1 else ""
 
         return {
             "id":         player_id,
-            "first_name": first,
-            "last_name":  last,
+            "first_name": parts[0] if parts else "",
+            "last_name":  parts[1] if len(parts) > 1 else "",
             "position":   position,
             "team": {
                 "id":           team_id,
