@@ -30,6 +30,9 @@ ODDS_API_KEY: str = _require("ODDS_API_KEY")
 # Pandascore (esports): https://pandascore.co/ — free tier 1000 req/hr
 PANDASCORE_API_KEY: str = os.getenv("PANDASCORE_API_KEY", "")
 
+# Anthropic Claude — used for vision (reading slip photos)
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+
 # ── Optional / tunable ────────────────────────────────────────────────────────
 # If set, slash commands sync instantly to a single test guild instead of
 # propagating globally (which can take up to an hour).

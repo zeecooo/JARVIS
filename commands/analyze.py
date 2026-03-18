@@ -10,9 +10,11 @@ commands/analyze.py - /analyze slash command.
 """
 
 import asyncio
+import base64
 import logging
 from typing import Optional
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -22,8 +24,56 @@ from database.db import save_analyzed_slip
 from utils.embeds import slip_embed, pick_embed, error_embed, info_embed
 from utils.player_lookup import resolve_name
 from data.sports_router import parse_slip_line, detect_sport, SPORT_EMOJI
+import config
 
 log = logging.getLogger(__name__)
+
+
+async def _extract_slip_from_image(image_url: str) -> str:
+    """Download an image and use Claude vision to extract the slip text."""
+    if not config.ANTHROPIC_API_KEY:
+        raise ValueError("ANTHROPIC_API_KEY is not set — cannot read images.")
+
+    import anthropic
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(image_url) as resp:
+            image_bytes = await resp.read()
+            content_type = resp.content_type or "image/png"
+
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": content_type,
+                            "data": image_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "This is a sports betting slip. Extract every pick/leg from it. "
+                            "Return ONLY a comma-separated list in this exact format: "
+                            "[Player Name] Over/Under [Line] [Prop Type]. "
+                            "Example: LeBron James Over 25.5 PTS, Patrick Mahomes Over 275.5 Passing Yards. "
+                            "Do not include any other text, explanations, or formatting."
+                        ),
+                    },
+                ],
+            }
+        ],
+    )
+    return message.content[0].text.strip()
 
 
 def _parse_universal_slip(slip_text: str) -> list[dict]:
@@ -132,21 +182,44 @@ class AnalyzeCog(commands.Cog, name="Analyze"):
 
     @app_commands.command(
         name="analyze",
-        description="Analyze a prop slip across any sport — NBA, NFL, NHL, Soccer, Tennis, Esports.",
+        description="Analyze a prop slip — type it out or upload a photo.",
     )
     @app_commands.describe(
-        slip=(
-            "Your picks separated by commas. "
-            "Format: [Player] Over/Under [line] [prop]. "
-            "All sports supported. Max 6 legs."
-        )
+        slip="Your picks separated by commas. Format: Player Over/Under Line Prop. Max 6 legs.",
+        image="Upload a photo of your betting slip to auto-read it.",
     )
     async def analyze(
         self,
         interaction: discord.Interaction,
-        slip: str,
+        slip: Optional[str] = None,
+        image: Optional[discord.Attachment] = None,
     ) -> None:
         await interaction.response.defer(thinking=True)
+
+        if not slip and not image:
+            await interaction.followup.send(
+                embed=error_embed(
+                    "No slip provided",
+                    "Either type your slip or upload a photo of it.",
+                )
+            )
+            return
+
+        # If image provided, extract slip text via Claude vision
+        if image:
+            if not image.content_type or not image.content_type.startswith("image/"):
+                await interaction.followup.send(
+                    embed=error_embed("Invalid file", "Please upload an image file (JPG, PNG, etc).")
+                )
+                return
+            try:
+                slip = await _extract_slip_from_image(image.url)
+                log.info("Extracted slip from image: %s", slip)
+            except Exception as exc:
+                await interaction.followup.send(
+                    embed=error_embed("Could not read image", str(exc))
+                )
+                return
 
         # Parse slip — supports all 6 sports
         legs = _parse_universal_slip(slip)
@@ -197,7 +270,7 @@ class AnalyzeCog(commands.Cog, name="Analyze"):
         try:
             slip_id = await save_analyzed_slip(
                 user_id=str(interaction.user.id),
-                slip_text=slip[:500],
+                slip_text=(slip or "")[:500],
                 score=overall_score,
                 legs=len(picks),
             )
@@ -207,7 +280,7 @@ class AnalyzeCog(commands.Cog, name="Analyze"):
         # Build main slip embed
         main_embed = slip_embed(
             picks=picks,
-            slip_text=slip,
+            slip_text=slip or "",
             overall_score=overall_score,
             slip_id=slip_id,
         )
