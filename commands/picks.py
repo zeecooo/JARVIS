@@ -451,10 +451,13 @@ class PicksCog(commands.Cog, name="Picks"):
     ) -> None:
         await interaction.response.defer(thinking=True)
 
-        # Check DB for existing picks from today
+        # Check DB for existing picks from today — skip stale ones (TBD or low confidence)
         existing = await get_recent_picks(sport=sport)
-        if existing:
-            best = existing[0]  # Already sorted by confidence DESC
+        best = next(
+            (p for p in existing if p.get("opponent", "TBD") != "TBD" and p.get("confidence", 0) >= 55),
+            None,
+        )
+        if best:
             # Re-create a lightweight PickResult from the DB row for the embed
             pr = PickResult(
                 player_name=best["player"],
@@ -534,9 +537,13 @@ class PicksCog(commands.Cog, name="Picks"):
     ) -> None:
         await interaction.response.defer(thinking=True)
 
-        # Check DB for a pick already generated today
+        # Check DB for a usable pick already generated today.
+        # Skip cached picks that have stale/incomplete data (TBD opponent or very low confidence).
         existing = await get_recent_picks(sport=sport)
-        best_db = existing[0] if existing else None
+        best_db = next(
+            (p for p in existing if p.get("opponent", "TBD") != "TBD" and p.get("confidence", 0) >= 55),
+            None,
+        )
 
         if best_db:
             pr = PickResult(

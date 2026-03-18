@@ -13,10 +13,20 @@ We convert each rowSet row to a lowercase-keyed dict for convenience.
 import asyncio
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from typing import Optional
 
 import aiohttp
+
+# Thread pool for running nba_api's synchronous calls off the event loop
+_executor = ThreadPoolExecutor(max_workers=4)
+
+
+async def _run_sync(fn, *args, **kwargs):
+    """Run a blocking function in a thread pool without blocking the event loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, lambda: fn(*args, **kwargs))
 
 log = logging.getLogger(__name__)
 
@@ -202,6 +212,14 @@ def _parse_result_set(data: dict, set_name: str = None) -> list[dict]:
         return []
     headers = [h.lower() for h in rs.get("headers", [])]
     return [dict(zip(headers, row)) for row in rs.get("rowSet", [])]
+
+
+def _safe_float(val) -> Optional[float]:
+    """Convert a value to float, returning None if not possible."""
+    try:
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_matchup(matchup: str) -> tuple[bool, str]:
@@ -474,20 +492,68 @@ class NBAClient:
     ) -> list[dict]:
         """
         Return up to last_n recent game logs for a player, newest first.
-        Each log matches the internal format expected by analysis/hit_rates.py.
+        Uses nba_api (handles NBA.com session/headers automatically).
+        Falls back to direct stats.nba.com call if nba_api unavailable.
         """
+        try:
+            from nba_api.stats.endpoints import playergamelog
+
+            def _fetch():
+                gl = playergamelog.PlayerGameLog(
+                    player_id=player_id,
+                    season=_current_nba_season(),
+                    season_type_all_star="Regular Season",
+                    timeout=20,
+                )
+                return gl.get_data_frames()[0]
+
+            df = await _run_sync(_fetch)
+            if df is None or df.empty:
+                log.warning("nba_api: no game logs for player %s", player_id)
+                return []
+
+            logs = []
+            for _, row in df.iterrows():
+                matchup = str(row.get("MATCHUP", ""))
+                is_home, opp_abbr = _parse_matchup(matchup)
+                player_abbr = matchup.split()[0] if matchup else ""
+                player_team_id = _ABBR_TO_ID.get(player_abbr, 0)
+                opp_team_id = _ABBR_TO_ID.get(opp_abbr, 0)
+                home_team_id = player_team_id if is_home else opp_team_id
+                visitor_team_id = opp_team_id if is_home else player_team_id
+                game_date = _parse_game_date(str(row.get("GAME_DATE", "")))
+
+                logs.append({
+                    "pts":  _safe_float(row.get("PTS")),
+                    "reb":  _safe_float(row.get("REB")),
+                    "ast":  _safe_float(row.get("AST")),
+                    "stl":  _safe_float(row.get("STL")),
+                    "blk":  _safe_float(row.get("BLK")),
+                    "fg3m": _safe_float(row.get("FG3M")),
+                    "min":  str(row.get("MIN", "") or ""),
+                    "game": {
+                        "date":            game_date,
+                        "home_team_id":    home_team_id,
+                        "visitor_team_id": visitor_team_id,
+                    },
+                    "_opp_abbr":    opp_abbr,
+                    "_opp_team_id": opp_team_id,
+                })
+                if len(logs) >= last_n:
+                    break
+
+            return logs
+
+        except Exception as exc:
+            log.warning("nba_api game logs failed for %s: %s — trying direct API", player_id, exc)
+
+        # Fallback: direct stats.nba.com call
         data = await self._stats_get(
             "playergamelog",
-            {
-                "PlayerID":   player_id,
-                "Season":     _current_nba_season(),
-                "SeasonType": "Regular Season",
-            },
+            {"PlayerID": player_id, "Season": _current_nba_season(), "SeasonType": "Regular Season"},
         )
         rows = _parse_result_set(data, "PlayerGameLog")
-        # NBA.com returns newest first by default
-        logs = [_convert_game_log(r) for r in rows[:last_n]]
-        return logs
+        return [_convert_game_log(r) for r in rows[:last_n]]
 
     async def get_h2h_games(
         self,
@@ -520,55 +586,72 @@ class NBAClient:
 
     async def get_team_defensive_stats(self) -> list[dict]:
         """
-        Fetch opponent (defensive) stats per team from NBA.com.
-        Returns a list matching the shape expected by analysis/defense.py:
-            [{team_id, avg_pts_allowed, avg_reb_allowed, avg_ast_allowed,
-              avg_threes_allowed, avg_blk_allowed, avg_stl_allowed, games_sample}]
+        Fetch opponent (defensive) stats per team.
+        Uses nba_api with fallback to direct stats.nba.com call.
         """
         if self._def_stats_cache is not None:
             return self._def_stats_cache
 
+        try:
+            from nba_api.stats.endpoints import leaguedashteamstats
+
+            def _fetch():
+                ls = leaguedashteamstats.LeagueDashTeamStats(
+                    season=_current_nba_season(),
+                    season_type_all_star="Regular Season",
+                    measure_type_detailed_defense="Opponent",
+                    per_mode_simple="PerGame",
+                    timeout=20,
+                )
+                return ls.get_data_frames()[0]
+
+            df = await _run_sync(_fetch)
+            if df is not None and not df.empty:
+                result = []
+                for _, row in df.iterrows():
+                    team_id = int(row.get("TEAM_ID") or 0)
+                    gp = max(int(row.get("GP") or 1), 1)
+                    result.append({
+                        "team_id":            team_id,
+                        "avg_pts_allowed":    float(row.get("OPP_PTS") or 0),
+                        "avg_reb_allowed":    float(row.get("OPP_REB") or 0),
+                        "avg_ast_allowed":    float(row.get("OPP_AST") or 0),
+                        "avg_threes_allowed": float(row.get("OPP_FG3M") or 0),
+                        "avg_blk_allowed":    float(row.get("OPP_BLK") or 0),
+                        "avg_stl_allowed":    float(row.get("OPP_STL") or 0),
+                        "games_sample":       gp,
+                    })
+                self._def_stats_cache = result
+                return result
+        except Exception as exc:
+            log.warning("nba_api defensive stats failed: %s — trying direct API", exc)
+
+        # Fallback: direct stats.nba.com call
         data = await self._stats_get(
             "leaguedashteamstats",
             {
-                "Conference":    "",
-                "DateFrom":      "",
-                "DateTo":        "",
-                "GameScope":     "",
-                "GameSegment":   "",
-                "LastNGames":    "0",
-                "LeagueID":      "00",
-                "Location":      "",
-                "MeasureType":   "Opponent",
-                "Month":         "0",
-                "OpponentTeamID": "0",
-                "Outcome":       "",
-                "PORound":       "0",
-                "PaceAdjust":    "N",
-                "PerMode":       "PerGame",
-                "Period":        "0",
-                "Season":        _current_nba_season(),
-                "SeasonType":    "Regular Season",
-                "TeamID":        "0",
+                "MeasureType": "Opponent", "PerMode": "PerGame",
+                "Season": _current_nba_season(), "SeasonType": "Regular Season",
+                "LeagueID": "00", "LastNGames": "0", "Month": "0",
+                "OpponentTeamID": "0", "PaceAdjust": "N", "PlusMinus": "N",
+                "Rank": "N", "TeamID": "0",
             },
         )
         rows = _parse_result_set(data, "LeagueDashTeamStats")
-
         result = []
         for row in rows:
             team_id = int(row.get("team_id") or 0)
             gp = max(int(row.get("gp") or 1), 1)
             result.append({
-                "team_id":             team_id,
-                "avg_pts_allowed":     float(row.get("opp_pts") or 0),
-                "avg_reb_allowed":     float(row.get("opp_reb") or 0),
-                "avg_ast_allowed":     float(row.get("opp_ast") or 0),
-                "avg_threes_allowed":  float(row.get("opp_fg3m") or 0),
-                "avg_blk_allowed":     float(row.get("opp_blk") or 0),
-                "avg_stl_allowed":     float(row.get("opp_stl") or 0),
-                "games_sample":        gp,
+                "team_id":            team_id,
+                "avg_pts_allowed":    float(row.get("opp_pts") or 0),
+                "avg_reb_allowed":    float(row.get("opp_reb") or 0),
+                "avg_ast_allowed":    float(row.get("opp_ast") or 0),
+                "avg_threes_allowed": float(row.get("opp_fg3m") or 0),
+                "avg_blk_allowed":    float(row.get("opp_blk") or 0),
+                "avg_stl_allowed":    float(row.get("opp_stl") or 0),
+                "games_sample":       gp,
             })
-
         self._def_stats_cache = result
         return result
 
