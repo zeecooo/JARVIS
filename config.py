@@ -23,8 +23,11 @@ def _require(key: str) -> str:
 
 # ── Required secrets ──────────────────────────────────────────────────────────
 DISCORD_TOKEN: str = _require("DISCORD_TOKEN")
-BALLDONTLIE_API_KEY: str = _require("BALLDONTLIE_API_KEY")
 ODDS_API_KEY: str = _require("ODDS_API_KEY")
+
+# BallDontLie is no longer used — NBA stats now come from stats.nba.com (free, no key).
+# Kept as optional so existing Railway env vars don't cause errors.
+BALLDONTLIE_API_KEY: str = os.getenv("BALLDONTLIE_API_KEY", "")
 
 # ── Optional sport API keys ────────────────────────────────────────────────────
 # Pandascore (esports): https://pandascore.co/ — free tier 1000 req/hr
@@ -46,7 +49,6 @@ DISCORD_GUILD_ID: int | None = (
 )
 
 # ── API base URLs ─────────────────────────────────────────────────────────────
-BALLDONTLIE_BASE = "https://api.balldontlie.io/v1"
 NHL_BASE         = "https://api-web.nhle.com/v1"
 ODDS_BASE        = "https://api.the-odds-api.com/v4"
 ESPN_NFL_BASE    = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"

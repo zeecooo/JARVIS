@@ -1,213 +1,406 @@
 """
-data/nba_client.py - Async client for the BallDontLie v2 NBA API.
+data/nba_client.py - Async NBA client using stats.nba.com (no API key required).
 
-All public methods return plain Python dicts/lists so the rest of the
-codebase has no dependency on this HTTP layer.
+Replaces the BallDontLie v2 client. All public methods return the same
+dict/list shapes as before so no other files need changes.
 
-BallDontLie API docs: https://www.balldontlie.io/
+NBA.com returns data in a resultSets format:
+  {"resultSets": [{"name": "...", "headers": [...], "rowSet": [[...]]}]}
+
+We convert each rowSet row to a lowercase-keyed dict for convenience.
 """
 
-import aiohttp
 import asyncio
 import logging
+import re
+from datetime import date, datetime
 from typing import Optional
-from datetime import date
 
-import config
+import aiohttp
 
 log = logging.getLogger(__name__)
 
-# ── Common nickname/abbreviation map ─────────────────────────────────────────
-# Entries are resolved *before* the API search so a single canonical
-# full name reaches the search endpoint.
+# ── Request headers ────────────────────────────────────────────────────────────
+# NBA.com blocks requests without these headers.
+
+_STATS_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Host": "stats.nba.com",
+    "Origin": "https://www.nba.com",
+    "Referer": "https://www.nba.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token": "true",
+}
+
+_CDN_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://www.nba.com/",
+}
+
+_STATS_BASE = "https://stats.nba.com/stats"
+_CDN_BASE = "https://cdn.nba.com"
+
+# ── Static NBA team data ───────────────────────────────────────────────────────
+# NBA team IDs are stable. Used to convert MATCHUP strings to team_id pairs.
+
+_NBA_TEAMS: dict[int, dict] = {
+    1610612737: {"abbreviation": "ATL", "full_name": "Atlanta Hawks",           "city": "Atlanta",        "name": "Hawks"},
+    1610612738: {"abbreviation": "BOS", "full_name": "Boston Celtics",          "city": "Boston",         "name": "Celtics"},
+    1610612751: {"abbreviation": "BKN", "full_name": "Brooklyn Nets",           "city": "Brooklyn",       "name": "Nets"},
+    1610612766: {"abbreviation": "CHA", "full_name": "Charlotte Hornets",       "city": "Charlotte",      "name": "Hornets"},
+    1610612741: {"abbreviation": "CHI", "full_name": "Chicago Bulls",           "city": "Chicago",        "name": "Bulls"},
+    1610612739: {"abbreviation": "CLE", "full_name": "Cleveland Cavaliers",     "city": "Cleveland",      "name": "Cavaliers"},
+    1610612742: {"abbreviation": "DAL", "full_name": "Dallas Mavericks",        "city": "Dallas",         "name": "Mavericks"},
+    1610612743: {"abbreviation": "DEN", "full_name": "Denver Nuggets",          "city": "Denver",         "name": "Nuggets"},
+    1610612765: {"abbreviation": "DET", "full_name": "Detroit Pistons",         "city": "Detroit",        "name": "Pistons"},
+    1610612744: {"abbreviation": "GSW", "full_name": "Golden State Warriors",   "city": "Golden State",   "name": "Warriors"},
+    1610612745: {"abbreviation": "HOU", "full_name": "Houston Rockets",         "city": "Houston",        "name": "Rockets"},
+    1610612754: {"abbreviation": "IND", "full_name": "Indiana Pacers",          "city": "Indiana",        "name": "Pacers"},
+    1610612746: {"abbreviation": "LAC", "full_name": "LA Clippers",             "city": "LA",             "name": "Clippers"},
+    1610612747: {"abbreviation": "LAL", "full_name": "Los Angeles Lakers",      "city": "Los Angeles",    "name": "Lakers"},
+    1610612763: {"abbreviation": "MEM", "full_name": "Memphis Grizzlies",       "city": "Memphis",        "name": "Grizzlies"},
+    1610612748: {"abbreviation": "MIA", "full_name": "Miami Heat",              "city": "Miami",          "name": "Heat"},
+    1610612749: {"abbreviation": "MIL", "full_name": "Milwaukee Bucks",         "city": "Milwaukee",      "name": "Bucks"},
+    1610612750: {"abbreviation": "MIN", "full_name": "Minnesota Timberwolves",  "city": "Minnesota",      "name": "Timberwolves"},
+    1610612740: {"abbreviation": "NOP", "full_name": "New Orleans Pelicans",    "city": "New Orleans",    "name": "Pelicans"},
+    1610612752: {"abbreviation": "NYK", "full_name": "New York Knicks",         "city": "New York",       "name": "Knicks"},
+    1610612760: {"abbreviation": "OKC", "full_name": "Oklahoma City Thunder",   "city": "Oklahoma City",  "name": "Thunder"},
+    1610612753: {"abbreviation": "ORL", "full_name": "Orlando Magic",           "city": "Orlando",        "name": "Magic"},
+    1610612755: {"abbreviation": "PHI", "full_name": "Philadelphia 76ers",      "city": "Philadelphia",   "name": "76ers"},
+    1610612756: {"abbreviation": "PHX", "full_name": "Phoenix Suns",            "city": "Phoenix",        "name": "Suns"},
+    1610612757: {"abbreviation": "POR", "full_name": "Portland Trail Blazers",  "city": "Portland",       "name": "Trail Blazers"},
+    1610612758: {"abbreviation": "SAC", "full_name": "Sacramento Kings",        "city": "Sacramento",     "name": "Kings"},
+    1610612759: {"abbreviation": "SAS", "full_name": "San Antonio Spurs",       "city": "San Antonio",    "name": "Spurs"},
+    1610612761: {"abbreviation": "TOR", "full_name": "Toronto Raptors",         "city": "Toronto",        "name": "Raptors"},
+    1610612762: {"abbreviation": "UTA", "full_name": "Utah Jazz",               "city": "Utah",           "name": "Jazz"},
+    1610612764: {"abbreviation": "WAS", "full_name": "Washington Wizards",      "city": "Washington",     "name": "Wizards"},
+}
+
+# Reverse lookup: abbreviation → team_id
+_ABBR_TO_ID: dict[str, int] = {v["abbreviation"]: k for k, v in _NBA_TEAMS.items()}
+
+# ── Nickname map (same as before) ─────────────────────────────────────────────
 _NICKNAME_MAP: dict[str, str] = {
-    # LeBron / Lakers
-    "lebron": "LeBron James",
-    "bron": "LeBron James",
-    "king james": "LeBron James",
-    # Kevin Durant
-    "kd": "Kevin Durant",
-    "slim reaper": "Kevin Durant",
-    # Anthony Davis
-    "ad": "Anthony Davis",
-    "the brow": "Anthony Davis",
-    # Stephen Curry
-    "steph": "Stephen Curry",
-    "chef curry": "Stephen Curry",
-    # Giannis Antetokounmpo
-    "giannis": "Giannis Antetokounmpo",
-    "greek freak": "Giannis Antetokounmpo",
-    # Nikola Jokic
-    "jokic": "Nikola Jokic",
-    "joker": "Nikola Jokic",
-    # Luka Doncic
-    "luka": "Luka Doncic",
-    "luka magic": "Luka Doncic",
-    # Jayson Tatum
-    "tatum": "Jayson Tatum",
-    "jt": "Jayson Tatum",
-    # Joel Embiid
-    "embiid": "Joel Embiid",
-    "the process": "Joel Embiid",
-    # Damian Lillard
-    "dame": "Damian Lillard",
-    "dame time": "Damian Lillard",
-    # James Harden
+    "lebron": "LeBron James", "bron": "LeBron James", "king james": "LeBron James",
+    "kd": "Kevin Durant", "slim reaper": "Kevin Durant",
+    "ad": "Anthony Davis", "the brow": "Anthony Davis",
+    "steph": "Stephen Curry", "chef curry": "Stephen Curry",
+    "giannis": "Giannis Antetokounmpo", "greek freak": "Giannis Antetokounmpo",
+    "jokic": "Nikola Jokic", "joker": "Nikola Jokic",
+    "luka": "Luka Doncic", "luka magic": "Luka Doncic",
+    "tatum": "Jayson Tatum", "jt": "Jayson Tatum",
+    "embiid": "Joel Embiid", "the process": "Joel Embiid",
+    "dame": "Damian Lillard", "dame time": "Damian Lillard",
     "the beard": "James Harden",
-    # Kawhi Leonard
-    "kawhi": "Kawhi Leonard",
-    "the claw": "Kawhi Leonard",
-    # Trae Young
-    "trae": "Trae Young",
-    "ice trae": "Trae Young",
-    # Devin Booker
+    "kawhi": "Kawhi Leonard", "the claw": "Kawhi Leonard",
+    "trae": "Trae Young", "ice trae": "Trae Young",
     "book": "Devin Booker",
-    # Ja Morant
     "ja": "Ja Morant",
-    # Donovan Mitchell
     "spida": "Donovan Mitchell",
-    # Paul George
-    "pg": "Paul George",
-    "pg13": "Paul George",
-    # Tyrese Haliburton
+    "pg": "Paul George", "pg13": "Paul George",
     "hali": "Tyrese Haliburton",
-    # Shai Gilgeous-Alexander
-    "sga": "Shai Gilgeous-Alexander",
-    "shai": "Shai Gilgeous-Alexander",
-    # Cade Cunningham
+    "sga": "Shai Gilgeous-Alexander", "shai": "Shai Gilgeous-Alexander",
     "cade": "Cade Cunningham",
-    # Evan Mobley
-    "evan": "Evan Mobley",
-    # Bam Adebayo
     "bam": "Bam Adebayo",
-    # Victor Wembanyama
-    "wemby": "Victor Wembanyama",
-    "wembanyama": "Victor Wembanyama",
+    "wemby": "Victor Wembanyama", "wembanyama": "Victor Wembanyama",
 }
 
 
 def _normalize_name(raw: str) -> str:
-    """
-    Resolve a nickname or abbreviated name to a best-guess full name.
-
-    Handles patterns like:
-      - 'AD' → 'Anthony Davis'
-      - 'T. Harris' → 'Tobias Harris' (partial, still needs API search)
-      - 'LeBron' → 'LeBron James'
-    """
     key = raw.strip().lower()
     if key in _NICKNAME_MAP:
         return _NICKNAME_MAP[key]
-
-    # Handle "T. Harris" style abbreviations — return just the last name so
-    # the search endpoint can find the right player in context.
     parts = raw.strip().split()
     if len(parts) == 2 and len(parts[0]) <= 2 and parts[0].endswith("."):
-        # Return the last name; the caller is expected to pass team context
         return parts[1]
-
     return raw.strip()
 
 
+# ── NBA.com result parsing ─────────────────────────────────────────────────────
+
+def _parse_result_set(data: dict, set_name: str = None) -> list[dict]:
+    """Convert a NBA.com resultSets response to a list of lowercase-keyed dicts."""
+    result_sets = data.get("resultSets") or []
+    if not result_sets:
+        return []
+    if set_name:
+        rs = next((r for r in result_sets if r.get("name") == set_name), None)
+    else:
+        rs = result_sets[0]
+    if not rs:
+        return []
+    headers = [h.lower() for h in rs.get("headers", [])]
+    return [dict(zip(headers, row)) for row in rs.get("rowSet", [])]
+
+
+def _parse_matchup(matchup: str) -> tuple[bool, str]:
+    """
+    Parse NBA.com MATCHUP string to (is_home, opponent_abbreviation).
+    Examples: "LAL vs. GSW" → (True, "GSW"), "LAL @ GSW" → (False, "GSW")
+    """
+    is_home = "vs." in matchup
+    parts = re.split(r"\s+(?:vs\.|@)\s+", matchup)
+    opp_abbr = parts[1].strip() if len(parts) > 1 else ""
+    return is_home, opp_abbr
+
+
+def _parse_game_date(raw_date: str) -> str:
+    """Convert NBA.com date strings to ISO format YYYY-MM-DD."""
+    for fmt in ("%b %d, %Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw_date.strip(), fmt).strftime("%Y-%m-%d")
+        except (ValueError, AttributeError):
+            continue
+    return raw_date[:10] if raw_date else ""
+
+
+def _convert_game_log(row: dict) -> dict:
+    """
+    Convert a NBA.com playergamelog row to our internal game log format.
+
+    Internal format (same field names as the old BallDontLie client):
+        pts, reb, ast, stl, blk, fg3m, min
+        game: {date, home_team_id, visitor_team_id}
+    """
+    matchup = row.get("matchup", "")
+    is_home, opp_abbr = _parse_matchup(matchup)
+
+    # Determine team IDs from matchup
+    player_abbr = matchup.split()[0] if matchup else ""
+    player_team_id = _ABBR_TO_ID.get(player_abbr, 0)
+    opp_team_id = _ABBR_TO_ID.get(opp_abbr, 0)
+
+    home_team_id = player_team_id if is_home else opp_team_id
+    visitor_team_id = opp_team_id if is_home else player_team_id
+
+    game_date = _parse_game_date(row.get("game_date", ""))
+
+    return {
+        "pts":  row.get("pts"),
+        "reb":  row.get("reb"),
+        "ast":  row.get("ast"),
+        "stl":  row.get("stl"),
+        "blk":  row.get("blk"),
+        "fg3m": row.get("fg3m"),
+        "min":  str(row.get("min", "") or ""),
+        "game": {
+            "date":            game_date,
+            "home_team_id":    home_team_id,
+            "visitor_team_id": visitor_team_id,
+        },
+        # Keep opponent abbr for H2H filtering
+        "_opp_abbr": opp_abbr,
+        "_opp_team_id": opp_team_id,
+    }
+
+
+# ── Season helper ──────────────────────────────────────────────────────────────
+
+def _current_nba_season() -> str:
+    """Return season string like '2025-26' for NBA.com API."""
+    today = date.today()
+    start_year = today.year if today.month >= 10 else today.year - 1
+    end_short = (start_year + 1) % 100
+    return f"{start_year}-{end_short:02d}"
+
+
+# Keep old name for compatibility with nhl_client import pattern
+def _current_nhl_season() -> str:
+    return _current_nba_season()
+
+
+# ── NBAClient ──────────────────────────────────────────────────────────────────
+
 class NBAClient:
-    """Async BallDontLie v2 API wrapper."""
+    """Async NBA stats client using stats.nba.com (no API key required)."""
 
     def __init__(self) -> None:
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._headers = {
-            "Authorization": config.BALLDONTLIE_API_KEY,
-            "Accept": "application/json",
-        }
+        self._stats_session: Optional[aiohttp.ClientSession] = None
+        self._cdn_session: Optional[aiohttp.ClientSession] = None
+        # In-memory cache: invalidate each bot restart
+        self._players_cache: Optional[list[dict]] = None
+        self._player_info_cache: dict[int, dict] = {}
+        self._def_stats_cache: Optional[list[dict]] = None
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT)
-            self._session = aiohttp.ClientSession(
-                headers=self._headers, timeout=timeout
+    async def _stats_get(self, path: str, params: dict = None) -> dict:
+        """GET from stats.nba.com with correct headers."""
+        if self._stats_session is None or self._stats_session.closed:
+            timeout = aiohttp.ClientTimeout(total=20)
+            self._stats_session = aiohttp.ClientSession(
+                headers=_STATS_HEADERS, timeout=timeout
             )
-        return self._session
-
-    async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    async def _get(self, path: str, params: Optional[dict] = None) -> dict:
-        """Issue a GET request and return the parsed JSON dict."""
-        session = await self._get_session()
-        url = f"{config.BALLDONTLIE_BASE}/{path}"
+        url = f"{_STATS_BASE}/{path}"
         try:
-            async with session.get(url, params=params) as resp:
+            async with self._stats_session.get(url, params=params) as resp:
                 resp.raise_for_status()
-                return await resp.json()
+                return await resp.json(content_type=None)
         except aiohttp.ClientResponseError as exc:
-            log.warning("BallDontLie HTTP %s for %s: %s", exc.status, url, exc.message)
+            log.warning("NBA.com HTTP %s for %s: %s", exc.status, url, exc.message)
             return {}
         except asyncio.TimeoutError:
-            log.warning("BallDontLie timeout for %s", url)
+            log.warning("NBA.com timeout for %s", url)
             return {}
-        except Exception as exc:  # noqa: BLE001
-            log.error("BallDontLie unexpected error for %s: %s", url, exc)
+        except Exception as exc:
+            log.error("NBA.com error for %s: %s", url, exc)
             return {}
 
-    # ── Player lookup ─────────────────────────────────────────────────────────
+    async def _cdn_get(self, path: str) -> dict:
+        """GET from cdn.nba.com."""
+        if self._cdn_session is None or self._cdn_session.closed:
+            timeout = aiohttp.ClientTimeout(total=15)
+            self._cdn_session = aiohttp.ClientSession(
+                headers=_CDN_HEADERS, timeout=timeout
+            )
+        url = f"{_CDN_BASE}/{path}"
+        try:
+            async with self._cdn_session.get(url) as resp:
+                resp.raise_for_status()
+                return await resp.json(content_type=None)
+        except Exception as exc:
+            log.warning("NBA CDN error for %s: %s", url, exc)
+            return {}
+
+    async def close(self) -> None:
+        for s in [self._stats_session, self._cdn_session]:
+            if s and not s.closed:
+                await s.close()
+
+    # ── Player lookup ──────────────────────────────────────────────────────────
+
+    async def _get_all_players(self) -> list[dict]:
+        """Fetch (and cache) all active NBA players for the current season."""
+        if self._players_cache is not None:
+            return self._players_cache
+
+        data = await self._stats_get(
+            "commonallplayers",
+            {
+                "LeagueID": "00",
+                "Season": _current_nba_season(),
+                "IsOnlyCurrentSeason": "1",
+            },
+        )
+        rows = _parse_result_set(data, "CommonAllPlayers")
+        self._players_cache = rows
+        log.info("Cached %d NBA players from NBA.com", len(rows))
+        return rows
 
     async def get_player(self, name: str) -> Optional[dict]:
         """
-        Search for a player by name (handles nicknames & abbreviations).
-        Returns the best-matching player dict or None.
+        Search for a player by name. Returns a dict matching the old
+        BallDontLie shape: {id, first_name, last_name, team: {...}, position}
         """
         resolved = _normalize_name(name)
-        data = await self._get("players", {"search": resolved, "per_page": 5})
-        players = data.get("data", [])
-        if not players:
-            # Fallback: search with raw name in case resolution was wrong
-            data = await self._get("players", {"search": name, "per_page": 5})
-            players = data.get("data", [])
+        players = await self._get_all_players()
 
-        if not players:
+        def _score(p: dict) -> int:
+            display = (p.get("display_first_last") or "").lower()
+            r = resolved.lower()
+            if display == r:
+                return 3
+            if r in display or display in r:
+                return 2
+            last = display.split()[-1] if display else ""
+            if r == last or r in last:
+                return 1
+            return 0
+
+        scored = [(p, _score(p)) for p in players]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        best = scored[0] if scored else (None, 0)
+
+        if best[1] == 0:
+            # Try raw name as fallback
+            resolved2 = name.strip().lower()
+            for p in players:
+                if resolved2 in (p.get("display_first_last") or "").lower():
+                    best = (p, 1)
+                    break
+
+        if not best[0]:
             return None
 
-        # Prefer active players and exact first/last name matches
-        resolved_lower = resolved.lower()
-        for player in players:
-            full = f"{player.get('first_name', '')} {player.get('last_name', '')}".lower()
-            if resolved_lower in full or full in resolved_lower:
-                return player
+        p = best[0]
+        player_id = p.get("person_id") or p.get("personid")
+        team_id = int(p.get("team_id") or 0)
+        team_info = _NBA_TEAMS.get(team_id, {})
 
-        # Return the first result as fallback
-        return players[0]
+        # Get position from player info (cached)
+        position = await self._get_player_position(player_id)
 
-    async def get_player_by_id(self, player_id: int) -> Optional[dict]:
-        """Fetch a single player record by numeric ID."""
-        data = await self._get(f"players/{player_id}")
-        return data if data else None
+        display = p.get("display_first_last", "")
+        parts = display.split(" ", 1)
+        first = parts[0] if parts else ""
+        last = parts[1] if len(parts) > 1 else ""
 
-    # ── Game logs ─────────────────────────────────────────────────────────────
+        return {
+            "id":         player_id,
+            "first_name": first,
+            "last_name":  last,
+            "position":   position,
+            "team": {
+                "id":           team_id,
+                "abbreviation": team_info.get("abbreviation", p.get("team_abbreviation", "")),
+                "full_name":    team_info.get("full_name", ""),
+                "city":         team_info.get("city", ""),
+                "name":         team_info.get("name", ""),
+            },
+        }
+
+    async def _get_player_position(self, player_id: int) -> str:
+        """Fetch player position from commonplayerinfo (cached per player)."""
+        if player_id in self._player_info_cache:
+            return self._player_info_cache[player_id]
+
+        data = await self._stats_get(
+            "commonplayerinfo",
+            {"PlayerID": player_id},
+        )
+        rows = _parse_result_set(data, "CommonPlayerInfo")
+        position = "F"
+        if rows:
+            raw_pos = rows[0].get("position", "")
+            # Normalize: "Forward", "Guard", "Center", "Forward-Center" etc.
+            raw_pos = raw_pos.strip()
+            if raw_pos.startswith("G"):
+                position = "G"
+            elif raw_pos.startswith("C"):
+                position = "C"
+            else:
+                position = "F"
+
+        self._player_info_cache[player_id] = position
+        return position
+
+    # ── Game logs ──────────────────────────────────────────────────────────────
 
     async def get_player_game_logs(
         self, player_id: int, last_n: int = 20
     ) -> list[dict]:
         """
-        Return up to `last_n` recent regular-season game logs for a player,
-        sorted newest-first.
-
-        Each log includes: game date, points, rebounds, assists, steals,
-        blocks, three_pointers_made, min (minutes), and opponent info.
+        Return up to last_n recent game logs for a player, newest first.
+        Each log matches the internal format expected by analysis/hit_rates.py.
         """
-        # BallDontLie v2 supports /stats?player_ids[]=X&per_page=N
-        data = await self._get(
-            "stats",
+        data = await self._stats_get(
+            "playergamelog",
             {
-                "player_ids[]": player_id,
-                "per_page": last_n,
-                "seasons[]": _current_season(),
+                "PlayerID":   player_id,
+                "Season":     _current_nba_season(),
+                "SeasonType": "Regular Season",
             },
         )
-        logs = data.get("data", [])
-
-        # Sort newest first based on game.date
-        logs.sort(key=lambda x: x.get("game", {}).get("date", ""), reverse=True)
-        return logs[:last_n]
+        rows = _parse_result_set(data, "PlayerGameLog")
+        # NBA.com returns newest first by default
+        logs = [_convert_game_log(r) for r in rows[:last_n]]
+        return logs
 
     async def get_h2h_games(
         self,
@@ -215,148 +408,113 @@ class NBAClient:
         opponent_team_id: int,
         last_n: int = 10,
     ) -> list[dict]:
-        """
-        Fetch the last `last_n` games a player has played *against* a specific
-        opponent team.
-        """
-        # Pull a larger window then filter by opponent
-        data = await self._get(
-            "stats",
-            {
-                "player_ids[]": player_id,
-                "per_page": 100,
-                "seasons[]": _current_season(),
-            },
-        )
-        logs = data.get("data", [])
-
+        """Return game logs where the player faced opponent_team_id."""
+        logs = await self.get_player_game_logs(player_id, last_n=100)
         h2h = [
             log for log in logs
-            if (
-                log.get("game", {}).get("home_team_id") == opponent_team_id
-                or log.get("game", {}).get("visitor_team_id") == opponent_team_id
-            )
+            if log.get("_opp_team_id") == opponent_team_id
         ]
-        h2h.sort(key=lambda x: x.get("game", {}).get("date", ""), reverse=True)
         return h2h[:last_n]
 
-    # ── Team stats ────────────────────────────────────────────────────────────
-
-    async def get_team_stats(self) -> list[dict]:
-        """
-        Return season-average team stats (used for defensive ranking).
-        Each entry includes team info and aggregated defensive metrics.
-        """
-        data = await self._get(
-            "season_averages",
-            {"season": _current_season_year()},
-        )
-        # BallDontLie also has a /teams endpoint for basic info
-        teams_data = await self._get("teams", {"per_page": 30})
-        return teams_data.get("data", [])
+    # ── Team data ──────────────────────────────────────────────────────────────
 
     async def get_teams(self) -> list[dict]:
-        """Return all NBA teams."""
-        data = await self._get("teams", {"per_page": 30})
-        return data.get("data", [])
+        """Return all NBA teams in the same shape as the old BallDontLie client."""
+        return [
+            {
+                "id":           tid,
+                "abbreviation": info["abbreviation"],
+                "full_name":    info["full_name"],
+                "city":         info["city"],
+                "name":         info["name"],
+            }
+            for tid, info in _NBA_TEAMS.items()
+        ]
 
     async def get_team_defensive_stats(self) -> list[dict]:
         """
-        Approximate defensive rankings by pulling opponent stats per team.
-        Returns a list of team dicts augmented with allowed_pts, allowed_reb,
-        allowed_ast averages for ranking purposes.
+        Fetch opponent (defensive) stats per team from NBA.com.
+        Returns a list matching the shape expected by analysis/defense.py:
+            [{team_id, avg_pts_allowed, avg_reb_allowed, avg_ast_allowed,
+              avg_threes_allowed, avg_blk_allowed, avg_stl_allowed, games_sample}]
         """
-        # Pull all game stats for the current season in bulk
-        # (BallDontLie v2 allows filtering by season)
-        data = await self._get(
-            "stats",
-            {"seasons[]": _current_season(), "per_page": 100},
+        if self._def_stats_cache is not None:
+            return self._def_stats_cache
+
+        data = await self._stats_get(
+            "leaguedashteamstats",
+            {
+                "Conference":    "",
+                "DateFrom":      "",
+                "DateTo":        "",
+                "GameScope":     "",
+                "GameSegment":   "",
+                "LastNGames":    "0",
+                "LeagueID":      "00",
+                "Location":      "",
+                "MeasureType":   "Opponent",
+                "Month":         "0",
+                "OpponentTeamID": "0",
+                "Outcome":       "",
+                "PORound":       "0",
+                "PaceAdjust":    "N",
+                "PerMode":       "PerGame",
+                "Period":        "0",
+                "Season":        _current_nba_season(),
+                "SeasonType":    "Regular Season",
+                "TeamID":        "0",
+            },
         )
-        stats = data.get("data", [])
-
-        # Aggregate points/reb/ast/threes allowed per team (as the defensive team)
-        from collections import defaultdict
-
-        team_totals: dict[int, dict] = defaultdict(
-            lambda: {
-                "games": 0,
-                "pts_allowed": 0.0,
-                "reb_allowed": 0.0,
-                "ast_allowed": 0.0,
-                "threes_allowed": 0.0,
-                "blk_allowed": 0.0,
-                "stl_allowed": 0.0,
-            }
-        )
-
-        for stat in stats:
-            game = stat.get("game", {})
-            # The "opponent" depends on whether the player's team is home or away
-            player_team_id = stat.get("team", {}).get("id")
-            home_id = game.get("home_team_id")
-            away_id = game.get("visitor_team_id")
-            opp_id = away_id if player_team_id == home_id else home_id
-            if opp_id:
-                team_totals[opp_id]["games"] += 1
-                team_totals[opp_id]["pts_allowed"] += stat.get("pts", 0) or 0
-                team_totals[opp_id]["reb_allowed"] += stat.get("reb", 0) or 0
-                team_totals[opp_id]["ast_allowed"] += stat.get("ast", 0) or 0
-                team_totals[opp_id]["threes_allowed"] += (
-                    stat.get("fg3m", 0) or 0
-                )
-                team_totals[opp_id]["blk_allowed"] += stat.get("blk", 0) or 0
-                team_totals[opp_id]["stl_allowed"] += stat.get("stl", 0) or 0
+        rows = _parse_result_set(data, "LeagueDashTeamStats")
 
         result = []
-        for team_id, totals in team_totals.items():
-            g = max(totals["games"], 1)
-            result.append(
-                {
-                    "team_id": team_id,
-                    "avg_pts_allowed": round(totals["pts_allowed"] / g, 2),
-                    "avg_reb_allowed": round(totals["reb_allowed"] / g, 2),
-                    "avg_ast_allowed": round(totals["ast_allowed"] / g, 2),
-                    "avg_threes_allowed": round(totals["threes_allowed"] / g, 2),
-                    "avg_blk_allowed": round(totals["blk_allowed"] / g, 2),
-                    "avg_stl_allowed": round(totals["stl_allowed"] / g, 2),
-                    "games_sample": g,
-                }
-            )
+        for row in rows:
+            team_id = int(row.get("team_id") or 0)
+            gp = max(int(row.get("gp") or 1), 1)
+            result.append({
+                "team_id":             team_id,
+                "avg_pts_allowed":     float(row.get("opp_pts") or 0),
+                "avg_reb_allowed":     float(row.get("opp_reb") or 0),
+                "avg_ast_allowed":     float(row.get("opp_ast") or 0),
+                "avg_threes_allowed":  float(row.get("opp_fg3m") or 0),
+                "avg_blk_allowed":     float(row.get("opp_blk") or 0),
+                "avg_stl_allowed":     float(row.get("opp_stl") or 0),
+                "games_sample":        gp,
+            })
+
+        self._def_stats_cache = result
         return result
 
-    # ── Injuries ──────────────────────────────────────────────────────────────
+    # ── Injuries ───────────────────────────────────────────────────────────────
 
     async def get_injuries(self) -> list[dict]:
         """
-        Return current injury report entries.
-        BallDontLie v2 exposes /player_injuries.
+        Return current injury report. NBA.com doesn't have a free injury API,
+        so we return an empty list. The scoring engine handles this gracefully.
         """
-        data = await self._get("player_injuries", {"per_page": 100})
-        return data.get("data", [])
+        return []
 
-    # ── Schedule ──────────────────────────────────────────────────────────────
+    # ── Schedule ───────────────────────────────────────────────────────────────
 
     async def get_todays_games(self) -> list[dict]:
-        """Return today's NBA game schedule."""
-        today = date.today().isoformat()
-        data = await self._get("games", {"dates[]": today, "per_page": 15})
-        return data.get("data", [])
+        """Return today's NBA games from the CDN scoreboard."""
+        data = await self._cdn_get(
+            "static/json/liveData/scoreboard/todaysScoreboard_00.json"
+        )
+        games = data.get("scoreboard", {}).get("games", [])
+        result = []
+        for g in games:
+            home = g.get("homeTeam", {})
+            away = g.get("awayTeam", {})
+            result.append({
+                "id":           g.get("gameId", ""),
+                "date":         g.get("gameEt", "")[:10],
+                "home_team":    {"id": home.get("teamId"), "abbreviation": home.get("teamTricode", "")},
+                "visitor_team": {"id": away.get("teamId"), "abbreviation": away.get("teamTricode", "")},
+                "status":       g.get("gameStatusText", ""),
+            })
+        return result
 
     async def get_games_on_date(self, game_date: str) -> list[dict]:
-        """Return games on a specific ISO date string."""
-        data = await self._get("games", {"dates[]": game_date, "per_page": 15})
-        return data.get("data", [])
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _current_season_year() -> int:
-    """Return the *start* year of the current NBA season (e.g. 2024 for 2024-25)."""
-    today = date.today()
-    # NBA season starts in October; if we're before October use last year
-    return today.year if today.month >= 10 else today.year - 1
-
-
-def _current_season() -> int:
-    """Alias for _current_season_year() — BallDontLie uses the start year."""
-    return _current_season_year()
+        """Alias for get_todays_games (CDN only serves today's scoreboard)."""
+        return await self.get_todays_games()
