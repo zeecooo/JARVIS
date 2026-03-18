@@ -79,6 +79,16 @@ CREATE TABLE IF NOT EXISTS bet_log (
 );
 """
 
+_CREATE_POTD_SETTINGS = """
+CREATE TABLE IF NOT EXISTS potd_settings (
+    guild_id    TEXT    PRIMARY KEY,
+    channel_id  TEXT    NOT NULL,
+    sport       TEXT    NOT NULL DEFAULT 'NBA',
+    post_hour   INTEGER NOT NULL DEFAULT 9,   -- UTC hour to post
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -89,6 +99,7 @@ async def init_db() -> None:
         await db.execute(_CREATE_BANKROLL)
         await db.execute(_CREATE_ANALYZED_SLIPS)
         await db.execute(_CREATE_BET_LOG)
+        await db.execute(_CREATE_POTD_SETTINGS)
         await db.commit()
 
 

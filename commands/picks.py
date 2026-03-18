@@ -21,6 +21,7 @@ from database.db import save_pick, get_recent_picks
 from utils.embeds import (
     picks_list_embed,
     pick_embed,
+    potd_embed as _potd_embed,
     error_embed,
     info_embed,
     COLOR_LOCK,
@@ -134,13 +135,15 @@ async def _fetch_todays_game_props(
     sport: str,
     min_confidence: int = 0,
     limit: int = 10,
+    force_return: bool = False,
 ) -> list[PickResult]:
     """
     Core helper: fetch today's games, get odds lines, score top props.
 
     Returns a sorted list of PickResult objects (highest confidence first).
+    If force_return=True, ignores min_confidence and returns the best picks
+    regardless (used by /pick and /potd so they never return empty).
     """
-    results: list[PickResult] = []
     template = _SPORT_TEMPLATES.get(sport.upper(), _NBA_TEMPLATE_PROPS)
 
     # Fetch shared context data once
@@ -209,9 +212,15 @@ async def _fetch_todays_game_props(
     tasks = [_score_one(p) for p in prop_list]
     scored = await asyncio.gather(*tasks)
 
-    results = [r for r in scored if r is not None and r.confidence >= min_confidence]
-    results.sort(key=lambda r: r.confidence, reverse=True)
-    return results[:limit]
+    all_results = [r for r in scored if r is not None]
+    all_results.sort(key=lambda r: r.confidence, reverse=True)
+
+    if force_return:
+        # Always return something — ignore min_confidence filter
+        return all_results[:limit]
+
+    filtered = [r for r in all_results if r.confidence >= min_confidence]
+    return filtered[:limit]
 
 
 async def _get_live_props(bot, sport: str) -> list[dict]:
@@ -430,10 +439,11 @@ class PicksCog(commands.Cog, name="Picks"):
             await interaction.followup.send(embed=embed)
             return
 
-        # Fetch fresh
+        # Fetch fresh — force_return=True means we always get the best pick
+        # even if its confidence is below the normal threshold
         try:
             top_picks = await _fetch_todays_game_props(
-                self.bot, sport=sport, min_confidence=50, limit=1
+                self.bot, sport=sport, min_confidence=0, limit=1, force_return=True
             )
         except Exception as exc:
             log.error("/pick error: %s", exc)
@@ -444,7 +454,11 @@ class PicksCog(commands.Cog, name="Picks"):
 
         if not top_picks:
             await interaction.followup.send(
-                embed=info_embed("No pick", f"No {sport} picks available right now.")
+                embed=info_embed(
+                    "No pick",
+                    f"Could not fetch any {sport} player data right now. "
+                    "Check that BALLDONTLIE_API_KEY is valid and the API is reachable."
+                )
             )
             return
 
@@ -468,6 +482,87 @@ class PicksCog(commands.Cog, name="Picks"):
             log.warning("Could not persist pick: %s", exc)
 
         embed = pick_embed(best, pick_id=pick_id)
+        await interaction.followup.send(embed=embed)
+
+
+    # ── /potd ──────────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="potd",
+        description="Pick of the Day — highest confidence play with full breakdown.",
+    )
+    @app_commands.describe(
+        sport="Sport to analyze (default: NBA)",
+    )
+    async def potd(
+        self,
+        interaction: discord.Interaction,
+        sport: Optional[Literal["NBA", "NHL", "NFL", "SOCCER", "TENNIS", "ESPORTS"]] = "NBA",
+    ) -> None:
+        await interaction.response.defer(thinking=True)
+
+        # Check DB for a pick already generated today
+        existing = await get_recent_picks(sport=sport)
+        best_db = existing[0] if existing else None
+
+        if best_db:
+            pr = PickResult(
+                player_name=best_db["player"],
+                team=best_db["team"],
+                opponent=best_db["opponent"],
+                prop_type=best_db["prop_type"],
+                line=best_db["line"],
+                direction="over",
+                sport=best_db["sport"],
+                confidence=best_db["confidence"],
+                recommendation=best_db["recommendation"],
+                odds=best_db.get("odds", "-110"),
+            )
+            embed = _potd_embed(pr, pick_id=best_db["id"])
+            await interaction.followup.send(embed=embed)
+            return
+
+        # Nothing in DB — score fresh
+        try:
+            top_picks = await _fetch_todays_game_props(
+                self.bot, sport=sport, min_confidence=0, limit=1, force_return=True
+            )
+        except Exception as exc:
+            log.error("/potd error: %s", exc)
+            await interaction.followup.send(
+                embed=error_embed("POTD unavailable", str(exc))
+            )
+            return
+
+        if not top_picks:
+            await interaction.followup.send(
+                embed=info_embed(
+                    "No POTD",
+                    f"Could not fetch any {sport} player data right now. "
+                    "Check that BALLDONTLIE_API_KEY is valid and the API is reachable."
+                )
+            )
+            return
+
+        best = top_picks[0]
+
+        pick_id = None
+        try:
+            pick_id = await save_pick(
+                player=best.player_name,
+                team=best.team,
+                opponent=best.opponent,
+                prop_type=best.prop_type,
+                line=best.line,
+                confidence=best.confidence,
+                recommendation=best.recommendation,
+                odds=best.odds,
+                sport=best.sport,
+            )
+        except Exception as exc:
+            log.warning("Could not persist POTD pick: %s", exc)
+
+        embed = _potd_embed(best, pick_id=pick_id)
         await interaction.followup.send(embed=embed)
 
 

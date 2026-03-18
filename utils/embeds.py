@@ -510,6 +510,95 @@ def firstbasket_embed(picks: list[dict]) -> discord.Embed:
     return embed
 
 
+# ── Pick of the Day embed ─────────────────────────────────────────────────────
+
+def potd_embed(pick: PickResult, pick_id: Optional[int] = None) -> discord.Embed:
+    """
+    Special Pick of the Day embed — same content as pick_embed but with
+    a gold header and star branding to distinguish it visually.
+    """
+    badge = BADGES.get(pick.recommendation, "👀 LEAN")
+    color = 0xFFD700  # Gold
+
+    title = (
+        f"⭐ PICK OF THE DAY  |  {badge}\n"
+        f"{pick.player_name}  "
+        f"{'Over' if pick.direction == 'over' else 'Under'} {pick.line} {pick.prop_type}"
+    )
+    desc = (
+        f"**{pick.sport}**  |  {pick.team} vs {pick.opponent}  |  "
+        f"{'🏠 Home' if pick.is_home else '✈️ Away'}"
+    )
+
+    embed = discord.Embed(title=title, description=desc, color=color)
+    embed.set_footer(text=f"Jarvis Analytics · POTD · {date.today().isoformat()}")
+
+    embed.add_field(
+        name="Confidence",
+        value=confidence_bar(pick.confidence),
+        inline=False,
+    )
+
+    hr = pick.hit_rates
+    if hr:
+        hr_lines = "\n".join([
+            hit_rate_bar(hr.get("l5", 0.0), "L5 "),
+            hit_rate_bar(hr.get("l10", 0.0), "L10"),
+            hit_rate_bar(hr.get("l20", 0.0), "L20"),
+        ])
+        trend_emoji = TREND_ARROWS.get(hr.get("trend", "flat"), "➡️")
+        hr_lines += f"\nTrend {trend_emoji}  |  Avg: **{hr.get('avg', 0):.1f}**"
+        embed.add_field(name="Hit Rates", value=hr_lines, inline=True)
+
+    if pick.defense_label:
+        def_emoji = _defense_emoji(pick.defense_rating)
+        embed.add_field(
+            name="Opp. Defense",
+            value=f"{def_emoji} **{pick.defense_label}**\n({pick.defense_rating.title()})",
+            inline=True,
+        )
+
+    if pick.h2h_games > 0:
+        embed.add_field(
+            name="H2H vs Opp",
+            value=f"{hit_rate_bar(pick.h2h_rate)} over {pick.h2h_games} games",
+            inline=True,
+        )
+
+    loc_label = "Home Rate" if pick.is_home else "Away Rate"
+    embed.add_field(name=loc_label, value=hit_rate_bar(pick.home_away_rate), inline=True)
+
+    trend_emoji = TREND_ARROWS.get(pick.min_trend, "➡️")
+    embed.add_field(
+        name="Minutes Trend",
+        value=f"{trend_emoji} L5 avg **{pick.avg_minutes:.1f}** min",
+        inline=True,
+    )
+
+    flags = []
+    if pick.back_to_back:
+        flags.append("⚠️ Back-to-back tonight")
+    if pick.injury_flag:
+        flags.append(f"🚑 Injury: {pick.injury_note}")
+    if pick.confidence < 55:
+        flags.append("⚠️ Limited data available — verify before placing")
+    if flags:
+        embed.add_field(name="⚠️ Flags", value="\n".join(flags), inline=False)
+
+    if pick.reasoning:
+        embed.add_field(name="Analysis", value="\n".join(pick.reasoning[:8]), inline=False)
+
+    footer_parts = []
+    if pick.odds:
+        footer_parts.append(f"Odds: {pick.odds}")
+    if pick_id:
+        footer_parts.append(f"Pick ID: #{pick_id}")
+    if footer_parts:
+        embed.add_field(name="\u200b", value=" | ".join(footer_parts), inline=False)
+
+    return embed
+
+
 # ── Error embed ───────────────────────────────────────────────────────────────
 
 def error_embed(title: str, description: str) -> discord.Embed:
