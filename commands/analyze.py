@@ -132,10 +132,7 @@ class AnalyzeCog(commands.Cog, name="Analyze"):
 
     @app_commands.command(
         name="analyze",
-        description=(
-            "Analyze a prop slip across any sport — NBA, NFL, NHL, Soccer, Tennis, Esports. "
-            "Example: LeBron Over 25.5 PTS, Mahomes Over 275.5 Passing Yards, ZywOo Over 25.5 Kills"
-        ),
+        description="Analyze a prop slip across any sport — NBA, NFL, NHL, Soccer, Tennis, Esports.",
     )
     @app_commands.describe(
         slip=(
