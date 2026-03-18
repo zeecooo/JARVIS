@@ -170,18 +170,31 @@ async def _fetch_todays_game_props(
     if live_props:
         prop_list = live_props
     else:
-        prop_list = [
-            {
-                "player": p[0],
+        # Fetch today's schedule so we can fill in real opponents
+        matchups: dict = {}
+        if sport == "NBA":
+            matchups = await _get_todays_nba_matchups(bot)
+
+        prop_list = []
+        for p in template:
+            # Look up the player's team abbreviation from the static map
+            from data.nba_client import _KNOWN_PLAYERS, _NBA_TEAMS
+            player_entry = _KNOWN_PLAYERS.get(p[0])
+            team_abbr = ""
+            if player_entry:
+                team_id = player_entry[1]
+                team_abbr = _NBA_TEAMS.get(team_id, {}).get("abbreviation", "")
+
+            opp, is_home = matchups.get(team_abbr, ("TBD", True))
+            prop_list.append({
+                "player":    p[0],
                 "prop_type": p[1],
-                "line": p[2],
-                "opponent": "TBD",
-                "is_home": True,
-                "odds": "-110",
-                "sport": sport,
-            }
-            for p in template
-        ]
+                "line":      p[2],
+                "opponent":  opp,
+                "is_home":   is_home,
+                "odds":      "-110",
+                "sport":     sport,
+            })
 
     sem = asyncio.Semaphore(4)
 
@@ -221,6 +234,26 @@ async def _fetch_todays_game_props(
 
     filtered = [r for r in all_results if r.confidence >= min_confidence]
     return filtered[:limit]
+
+
+async def _get_todays_nba_matchups(bot) -> dict[str, tuple[str, bool]]:
+    """
+    Fetch today's NBA schedule from the CDN scoreboard.
+    Returns {team_abbr: (opponent_abbr, is_home)} for every team playing today.
+    """
+    try:
+        games = await bot.nba_client.get_todays_games()
+        matchups: dict[str, tuple[str, bool]] = {}
+        for game in games:
+            home = game.get("home_team", {}).get("abbreviation", "")
+            away = game.get("visitor_team", {}).get("abbreviation", "")
+            if home and away:
+                matchups[home] = (away, True)
+                matchups[away] = (home, False)
+        return matchups
+    except Exception as exc:
+        log.warning("Could not fetch today's NBA schedule: %s", exc)
+        return {}
 
 
 async def _get_live_props(bot, sport: str) -> list[dict]:
