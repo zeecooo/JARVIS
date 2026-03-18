@@ -10,7 +10,6 @@ commands/analyze.py - /analyze slash command.
 """
 
 import asyncio
-import base64
 import logging
 from typing import Optional
 
@@ -30,50 +29,36 @@ log = logging.getLogger(__name__)
 
 
 async def _extract_slip_from_image(image_url: str) -> str:
-    """Download an image and use Claude vision to extract the slip text."""
-    if not config.ANTHROPIC_API_KEY:
-        raise ValueError("ANTHROPIC_API_KEY is not set — cannot read images.")
-
-    import anthropic
+    """Download an image and use OCR.Space to extract the slip text."""
+    if not config.OCR_SPACE_API_KEY:
+        raise ValueError("OCR_SPACE_API_KEY is not set — cannot read images.")
 
     async with aiohttp.ClientSession() as session:
         async with session.get(image_url) as resp:
             image_bytes = await resp.read()
-            content_type = resp.content_type or "image/png"
 
-    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        data = aiohttp.FormData()
+        data.add_field("apikey", config.OCR_SPACE_API_KEY)
+        data.add_field("language", "eng")
+        data.add_field("isOverlayRequired", "false")
+        data.add_field(
+            "file",
+            image_bytes,
+            filename="slip.png",
+            content_type="image/png",
+        )
 
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=512,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": content_type,
-                            "data": image_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "This is a sports betting slip. Extract every pick/leg from it. "
-                            "Return ONLY a comma-separated list in this exact format: "
-                            "[Player Name] Over/Under [Line] [Prop Type]. "
-                            "Example: LeBron James Over 25.5 PTS, Patrick Mahomes Over 275.5 Passing Yards. "
-                            "Do not include any other text, explanations, or formatting."
-                        ),
-                    },
-                ],
-            }
-        ],
-    )
-    return message.content[0].text.strip()
+        async with session.post("https://api.ocr.space/parse/image", data=data) as resp:
+            result = await resp.json()
+
+    if result.get("IsErroredOnProcessing"):
+        raise ValueError(f"OCR.Space error: {result.get('ErrorMessage', 'unknown')}")
+
+    parsed = result.get("ParsedResults", [])
+    if not parsed:
+        raise ValueError("OCR.Space returned no text.")
+
+    return parsed[0].get("ParsedText", "").strip()
 
 
 def _parse_universal_slip(slip_text: str) -> list[dict]:
